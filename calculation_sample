@@ -1,21 +1,15 @@
 def generate_plan(self, state: AgentState, metrics: List[str]) -> List[Dict]:
     """Generate execution plan based on intents found in the tagged data."""
-    # 1. Get feedback insights (for LLM prompt)
+    # 1. Get feedback insights
     insights = self.query_agent.feedback_collector.learn_from_feedback()
    
     # 2. Extract unique intents from DataFrame with optimization and safety
     intents = []
     if state.data is not None and 'intent' in state.data.columns:
         try:
-            # Flatten lists and get unique intents, handling non-list entries
-            flattened_intents = []
-            for row_intents in state.data['intent']:
-                if isinstance(row_intents, list):
-                    flattened_intents.extend(row_intents)
-                elif isinstance(row_intents, str):
-                    flattened_intents.append(row_intents)
-            intents = list(set(flattened_intents))  # Unique with set
-            intents = [intent for intent in intents if intent]  # Filter empty/None
+            from itertools import chain
+            intents = list(set(chain.from_iterable(state.data['intent'])))
+            intents = [intent for intent in intents if intent]  # Filter out None/empty
         except Exception as e:
             logging.error(f"Intent extraction failed: {str(e)}")
             intents = []
@@ -25,7 +19,7 @@ def generate_plan(self, state: AgentState, metrics: List[str]) -> List[Dict]:
         intents = ["fetch_metric"]
     print(f"Derived Intents: {intents}")  # Debug derived intents
    
-    # 4. SAFE PROMPT TEMPLATE (verified placeholders, with LLM enforcement)
+    # 4. SAFE PROMPT TEMPLATE (verified placeholders, corrected structure)
     prompt_template = """
 Generate an execution plan for these intents: {intents_list}
 Available metrics: {metrics_list}
@@ -35,14 +29,14 @@ Tool mapping reference:
 {mapping_json}
 Use ONLY 'tools' key for tool definitions. NEVER use 'steps' - using 'steps' will be rejected as invalid.
 Multiple tools can be used per intent (e.g., compute_metric then generate_plot for compare_metric).
-Return JSON format:
+Return valid JSON format:
 [{
-    "intent": "intent_name",
+    "intent": "{intents_list.split(', ')[0]}",
     "tools": [{
         "tool": "tool_name",
         "args": {
             "metric": "primary_metric",
-            "intent_filter": ["matching_intent"]
+            "intent_filter": ["{intents_list.split(', ')[0]}"]
         }
     }]
 }]
@@ -50,23 +44,24 @@ Example:
 {{
     "intent": "compare_metric",
     "tools": [
-        {{
+        {
             "tool": "compare_metric",
-            "args": {{
+            "args": {
                 "metric": "efficiency",
                 "intent_filter": ["compare_metric"]
-            }}
-        }},
-        {{
+            }
+        },
+        {
             "tool": "visualize_metric",
-            "args": {{
+            "args": {
                 "metric": "efficiency",
                 "intent_filter": ["compare_metric"]
-            }}
-        }}
+            }
+        }
     ]
 }}
 """
+    print("Prompt Template:", prompt_template)  # Debug to verify placeholders
    
     # 5. Prepare template variables with EXACT matching names
     template_vars = {
@@ -77,7 +72,7 @@ Example:
         'mapping_json': json.dumps(self.intent_tool_mapping, indent=2)
     }
    
-    # 6. Debugging output (temporarily add this)
+    # 6. Debugging output
     print("Template Variables:")
     for k, v in template_vars.items():
         print(f"{k}: {v}")
@@ -358,6 +353,7 @@ def generate_plan(self, state: AgentState, metrics: List[str]) -> List[Dict]:
         logging.warning(f"JSON parse error: {str(e)}. Raw response: {raw_response_content}. Returning default plan.")
         default_intents = [ctx["intent"] for ctx in state.extracted_context.get("query_analysis", [])]
         return [{"intent": intent, "tools": [{"tool": intent, "args": {"metric": metrics[0] if metrics else "efficiency", "intent_filter": [intent]}}]} for intent in default_intents]
+
 
 
 
