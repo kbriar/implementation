@@ -1,4 +1,81 @@
 def generate_plan(self, state: AgentState, metrics: List[str]) -> List[Dict]:
+    """Generate execution plan based on intents found in the tagged data."""
+    # 1. Get feedback insights
+    insights = self.query_agent.feedback_collector.learn_from_feedback()
+    
+    # 2. Extract unique intents from state.data['intent'] with optimization
+    intents = []
+    if state.data is not None and 'intent' in state.data.columns:
+        try:
+            from itertools import chain
+            intents = list(set(chain.from_iterable(state.data['intent'])))
+            intents = [intent for intent in intents if intent]  # Filter out None/empty
+        except Exception as e:
+            logging.error(f"Intent extraction from state.data failed: {str(e)}")
+            intents = []
+    if not intents:
+        logging.warning("No intents found in state.data. Falling back to default 'fetch_metric'.")
+        intents = ["fetch_metric"]
+    print(f"Derived Intents: {intents}")  # Debug intents
+
+    # 3. Generate LLM prompt with strict structure enforcement
+    prompt_template = """
+    Given:
+    - Query: {user_query}
+    - Intents: {intents}
+    - Metrics: {metrics}
+    - Past issues to avoid: {insights}
+    Generate execution plan using this tool mapping: {intent_tool_mapping}
+    Use ONLY 'tools' key for tool definitions. NEVER use 'steps'—using 'steps' will be rejected.
+    Multiple tools can be used per intent (e.g., compute_metric then generate_plot for compare_metric).
+    Return valid JSON plan with EXACT structure: [{"intent": "intent_name", "tools": [{"tool": "tool_name", "args": {"metric": "metric_name", "intent_filter": ["intent_name"], "days_ahead": 30}}]}]
+    Ensure the response is valid JSON and contains only the JSON object.
+    Example: [{"intent": "fetch_metric", "tools": [{"tool": "fetch_metric", "args": {"metric": "efficiency", "intent_filter": ["fetch_metric"], "days_ahead": 30}}]}]
+    """
+    
+    prompt = prompt_template.format(
+        user_query=state.user_query,
+        intents=intents,
+        metrics=metrics,
+        insights=insights,
+        intent_tool_mapping=json.dumps(self.intent_tool_mapping, indent=2)
+    )
+    print("Generated Prompt:\n", prompt)  # Debug prompt
+
+    # 4. Execute LLM and parse response
+    try:
+        response = self.llm.invoke(prompt)
+        raw_response_content = response.content.strip()
+        print("Raw LLM Response:\n", raw_response_content)  # Debug raw response
+        cleaned_response = raw_response_content.replace("```json", "").replace("```", "").strip()
+        plan = json.loads(cleaned_response)
+        
+        # 5. Validate and normalize plan
+        validated_plan = []
+        for item in plan:
+            if isinstance(item, dict) and item.get("intent") in intents:
+                tools = item.get("tools", [])
+                if not tools:
+                    tools = [{"tool": item["intent"], "args": {"metric": metrics[0] if metrics else "efficiency", "intent_filter": [item["intent"]]}}]
+                validated_plan.append({"intent": item["intent"], "tools": tools})
+        print("Processed Plan:", json.dumps(validated_plan, indent=2))  # Debug processed plan
+        return validated_plan if validated_plan else [{"intent": intents[0], "tools": [{"tool": intents[0], "args": {"metric": metrics[0] if metrics else "efficiency", "intent_filter": [intents[0]]}}]}]
+        
+    except Exception as e:
+        logging.error(f"Plan generation failed: {str(e)}. Raw response: {raw_response_content if 'raw_response_content' in locals() else 'N/A'}")
+        # 6. Fallback plan generation
+        return [{
+            "intent": intent,
+            "tools": [{
+                "tool": next((tool for tool in self.intent_tool_mapping.get(intent, [intent]) if tool), intent),
+                "args": {
+                    "metric": metrics[0] if metrics else "efficiency",
+                    "intent_filter": [intent]
+                }
+            }]
+        } for intent in intents]
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+def generate_plan(self, state: AgentState, metrics: List[str]) -> List[Dict]:
     insights = self.query_agent.feedback_collector.learn_from_feedback()
     # Get intents from extracted_context if available
     intents = [ctx["intent"] for ctx in state.extracted_context.get("query_analysis", [])] if state.extracted_context else []
@@ -230,5 +307,6 @@ def generate_plan(self, state: AgentState, metrics: List[str]) -> List[Dict]:
         logging.warning(f"JSON parse error: {str(e)}. Raw response: {raw_response_content}. Returning default plan.")
         default_intents = [ctx["intent"] for ctx in state.extracted_context.get("query_analysis", [])]
         return [{"intent": intent, "tools": [{"tool": intent, "args": {"metric": metrics[0] if metrics else "efficiency", "intent_filter": [intent]}}]} for intent in default_intents]
+
 
 
