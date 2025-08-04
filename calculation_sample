@@ -47,4 +47,52 @@ def compute_metrics(self, df: pd.DataFrame, metrics: List[str], intent_filter: L
             grouped.loc[mask, metric] = np.nan
         df = df.merge(grouped[[*groupby_dims, metric]], on=groupby_dims, how='left')  # Fixed: Use grouped[[*groupby_dims, metric]]
     df.drop(columns=temp_cols, inplace=True, errors='ignore')
+
     return df
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+def generate_plan(self, state: AgentState, metrics: List[str]) -> List[Dict]:
+    insights = self.query_agent.feedback_collector.learn_from_feedback()
+    prompt_template = """
+    Given query: {user_query}
+    Intents: {intents}
+    Context: {context}
+    Available metrics: {metrics}
+    Past feedback summary (adapt to avoid mistakes): {insights}
+    Plan steps/tools to execute, then call tools for each intent based on mapping {intent_tool_mapping}.
+    Use ONLY 'tools' key for tool definitions. NEVER use 'steps'—using 'steps' will result in an invalid response. 
+    Multiple tools can be used per intent (e.g., compute_metric then generate_plot for compare_metric).
+    Return valid JSON plan with EXACT structure: [{"intent": "intent_name", "tools": [{"tool": "tool_name", "args": {"metric": "metric_name", "intent_filter": ["intent_name"], "days_ahead": 30}}]}]
+    Ensure the response is valid JSON and contains only the JSON object.
+    Example: [{"intent": "fetch_metric", "tools": [{"tool": "fetch_metric", "args": {"metric": "efficiency", "intent_filter": ["fetch_metric"], "days_ahead": 30}}]}]
+    """
+    
+    prompt = prompt_template.format(
+        user_query=state.user_query,
+        intents=state.intent,
+        context=state.extracted_context,
+        metrics=metrics,
+        insights=insights,
+        intent_tool_mapping=json.dumps(self.intent_tool_mapping)
+    )
+    
+    print("Generated Prompt:\n", prompt)
+    response = self.llm.invoke(prompt)
+    raw_response_content = response.content.strip()
+    print("Raw LLM Response:\n", raw_response_content)
+    try:
+        cleaned_response = raw_response_content.replace("```json", "").replace("```", "").strip()
+        plan = json.loads(cleaned_response)
+        # Convert "steps" to "tools" before returning
+        for i, step in enumerate(plan):
+            if "steps" in step and "tools" not in step:
+                plan[i]["tools"] = plan[i].pop("steps")
+            elif "tools" not in step:
+                plan[i]["tools"] = [{"tool": step.get("intent", ""), "args": {"metric": metrics[0] if metrics else "efficiency", "intent_filter": [step.get("intent", "")]}}]
+        print("Processed Plan:", json.dumps(plan, indent=2))  # Debug the processed plan
+        return plan
+    except json.JSONDecodeError as e:
+        logging.warning(f"JSON parse error: {str(e)}. Raw response: {raw_response_content}. Returning default plan.")
+        default_intents = [ctx["intent"] for ctx in state.extracted_context.get("query_analysis", [])]
+        return [{"intent": intent, "tools": [{"tool": intent, "args": {"metric": metrics[0] if metrics else "efficiency", "intent_filter": [intent]}}]} for intent in default_intents]
