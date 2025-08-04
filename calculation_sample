@@ -1,3 +1,139 @@
+def generate_plan(self, state: AgentState, metrics: List[str]) -> List[Dict]:
+    insights = self.query_agent.feedback_collector.learn_from_feedback()
+    # Derive intents from extracted_context if available, fallback to empty list
+    intents = [ctx["intent"] for ctx in state.extracted_context.get("query_analysis", [])] if state.extracted_context else []
+    prompt_template = """
+    Given query: {user_query}
+    Intents: {intents}
+    Context: {context}
+    Available metrics: {metrics}
+    Past feedback summary (adapt to avoid mistakes): {insights}
+    Plan steps/tools to execute, then call tools for each intent based on mapping {intent_tool_mapping}.
+    Use ONLY 'tools' key for tool definitions. NEVER use 'steps'—using 'steps' will result in an invalid response. 
+    Multiple tools can be used per intent (e.g., compute_metric then generate_plot for compare_metric).
+    Return valid JSON plan with EXACT structure: [{"intent": "intent_name", "tools": [{"tool": "tool_name", "args": {"metric": "metric_name", "intent_filter": ["intent_name"], "days_ahead": 30}}]}]
+    Ensure the response is valid JSON and contains only the JSON object.
+    Example: [{"intent": "fetch_metric", "tools": [{"tool": "fetch_metric", "args": {"metric": "efficiency", "intent_filter": ["fetch_metric"], "days_ahead": 30}}]}]
+    """
+    
+    prompt = prompt_template.format(
+        user_query=state.user_query,
+        intents=intents,  # Use derived intents
+        context=state.extracted_context,
+        metrics=metrics,
+        insights=insights,
+        intent_tool_mapping=json.dumps(self.intent_tool_mapping)
+    )
+    
+    print("Generated Prompt:\n", prompt)
+    response = self.llm.invoke(prompt)
+    raw_response_content = response.content.strip()
+    print("Raw LLM Response:\n", raw_response_content)
+    try:
+        cleaned_response = raw_response_content.replace("```json", "").replace("```", "").strip()
+        plan = json.loads(cleaned_response)
+        # Convert "steps" to "tools" before returning
+        for i, step in enumerate(plan):
+            if "steps" in step and "tools" not in step:
+                plan[i]["tools"] = plan[i].pop("steps")
+            elif "tools" not in step:
+                plan[i]["tools"] = [{"tool": step.get("intent", ""), "args": {"metric": metrics[0] if metrics else "efficiency", "intent_filter": [step.get("intent", "")]}}]
+        print("Processed Plan:", json.dumps(plan, indent=2))  # Debug the processed plan
+        return plan
+    except json.JSONDecodeError as e:
+        logging.warning(f"JSON parse error: {str(e)}. Raw response: {raw_response_content}. Returning default plan.")
+        default_intents = [ctx["intent"] for ctx in state.extracted_context.get("query_analysis", [])] if state.extracted_context else []
+        return [{"intent": intent, "tools": [{"tool": intent, "args": {"metric": metrics[0] if metrics else "efficiency", "intent_filter": [intent]}}]} for intent in default_intents]
+
+def process(self, state: AgentState) -> AgentState:
+    state.extracted_context = self.query_agent.process(state.user_query)
+    if state.extracted_context is not None:
+        print("QueryUnderstandingAgent Output:")
+        print(json.dumps(state.extracted_context, indent=2))
+    
+    state.data = self.data_agent.fetch_data(state.extracted_context)
+    if state.data is not None and not state.data.empty:
+        print("DataRetrievalAgent Final DataFrame:")
+        display(state.data.head())
+        print(f"Shape: {state.data.shape}")
+        state.data.columns = state.data.columns.str.strip()  # Remove leading/trailing spaces
+        state.data.columns = state.data.columns.str.replace(' ', '_')  # Replace inner spaces with underscores
+        state.data.columns = state.data.columns.str.lower()  # Convert to lowercase for consistency
+        print("Normalized DataFrame Column Names:")
+        print(state.data.columns.tolist())
+    else:
+        print("No data available after retrieval - skipping normalization.")
+    
+    if state.data is None:
+        state.errors = ["Data retrieval failed"]
+        return state
+    all_metrics_to_compute = set()
+    for intent_ctx in state.extracted_context.get("query_analysis", []):
+        all_metrics_to_compute.update(intent_ctx.get("metrics", []))
+    if all_metrics_to_compute:
+        state.data = self.analysis_agent.compute_metrics(state.data, list(all_metrics_to_compute))
+        logging.info(f"Metrics computed. DataFrame columns: {state.data.columns.tolist()}")
+    else:
+        logging.warning("No metrics identified for computation.")
+    plan = self.generate_plan(state, list(all_metrics_to_compute))
+    print("Generated Plan:", json.dumps(plan, indent=2))  # Debug the plan
+    analysis_results = {}
+    for step in plan:
+        intent = step["intent"]
+        tools = step.get("tools", [])  # Use .get() to avoid KeyError
+        if not tools:  # Fallback if no tools defined
+            tools = [{"tool": intent, "args": {"metric": next(iter(all_metrics_to_compute)) if all_metrics_to_compute else "efficiency", "intent_filter": [intent]}}]
+        for tool_step in tools:
+            tool_name = tool_step.get("tool", intent)
+            args = tool_step.get("args", {})
+            args["data"] = state.data
+            args["extracted_context"] = state.extracted_context
+            if "metrics" not in args:
+                for qa in state.extracted_context.get("query_analysis", []):
+                    if qa["intent"] == intent and "metrics" in qa:
+                        args["metrics"] = qa["metrics"]
+                        break
+            result = self.execute_tool(tool_name, args)
+            if "error" not in result:
+                if intent not in analysis_results:
+                    analysis_results[intent] = {}
+                analysis_results[intent][tool_name] = result
+            else:
+                if intent not in analysis_results:
+                    analysis_results[intent] = {}
+                analysis_results[intent][tool_name] = result
+    state.analysis_results = analysis_results
+    report_parts = []
+    for intent, tool_results in analysis_results.items():
+        report_parts.append(f"**{intent.replace('_', ' ').title()}:**")
+        for tool_name, res in tool_results.items():
+            report_parts.append(f"  - {tool_name.replace('_', ' ').title()}: {res.get('summary', str(res))}")
+            if 'table' in res:
+                report_parts.append(res['table'])
+            if 'plot' in res:
+                report_parts.append(f"    |Plot: {res['plot']}|")
+            if 'prediction' in res:
+                report_parts.append(f"    Prediction: {res['prediction']} on {res.get('date', 'N/A')}")
+            if 'report' in res:
+                report_parts.append(res['report'])
+            if 'error' in res:
+                report_parts.append(f"    Error: {res['error']}")
+    
+    state.report = "\n".join(report_parts) if report_parts else "No analysis results to report."
+    programmatic_feedback = "Processed successfully" if not any("error" in intent_res.values() for intent_res in analysis_results.values()) else "Error occurred during processing or analysis"
+    self.query_agent.feedback_collector.add_feedback(state.user_query, programmatic_feedback, "programmatic")
+    user_feedback = self.query_agent.feedback_collector.collect_user_feedback(state.user_query)
+    if user_feedback and any(word in user_feedback.lower() for word in ["error", "wrong", "inaccurate", "missing"]):
+        self.query_agent.vector_store.add_query(f"Bad example: {state.user_query} - Feedback: {user_feedback}")
+    
+    insights = self.query_agent.feedback_collector.get_feedback_insights()
+    if insights:
+        state.report += "\n\n**Feedback Insights:** " + json.dumps(insights)
+    
+    return state
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
 def compute_metrics(self, df: pd.DataFrame, metrics: List[str], intent_filter: List[str] = None) -> pd.DataFrame:
     if intent_filter and df.empty:
         logging.warning(f"No data for intent_filter: {intent_filter}")
@@ -96,3 +232,4 @@ def generate_plan(self, state: AgentState, metrics: List[str]) -> List[Dict]:
         logging.warning(f"JSON parse error: {str(e)}. Raw response: {raw_response_content}. Returning default plan.")
         default_intents = [ctx["intent"] for ctx in state.extracted_context.get("query_analysis", [])]
         return [{"intent": intent, "tools": [{"tool": intent, "args": {"metric": metrics[0] if metrics else "efficiency", "intent_filter": [intent]}}]} for intent in default_intents]
+
