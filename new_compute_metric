@@ -1,51 +1,54 @@
 def compute_metrics(self, df: pd.DataFrame, metrics: List[str], intent_filter: List[str] = None) -> pd.DataFrame:
-    if intent_filter and df.empty:
+    # 1. Filter the original DataFrame based on intent
+    if intent_filter and not df.empty:
+        df = df[df['intent'].apply(lambda x: any(i in x for i in intent_filter))].copy()
+        print(f"Debug: After intent filter, df shape: {df.shape}, columns: {df.columns.tolist()}")  # Debug
+    elif df.empty:
         logging.warning(f"No data for intent_filter: {intent_filter}")
         return df
-    if intent_filter:
-        df = df[df['intent'].apply(lambda x: any(i in x for i in intent_filter))]
-    col_map = {col.strip(): col for col in df.columns}  # Preserve original case, strip spaces
+
+    col_map = {col.strip().lower(): col for col in df.columns}  # Case-insensitive mapping
     temp_cols = []
     for metric in metrics:
         if metric not in self.semantic_layer['metrics']:
             continue
         formula = self.semantic_layer['metrics'][metric]['formula']
         parts = formula.split('/')
-        num_expr = parts[0].replace('SUM(', '').replace(')', '').strip().replace(' ', '')  # Remove all spaces
-        den_expr = parts[1].replace('SUM(', '').replace(')', '').strip().replace(' ', '') if len(parts) > 1 else '1'
+        num_expr = parts[0].replace('SUM(', '').replace(')', '').strip().replace(' ', '').lower()
+        den_expr = parts[1].replace('SUM(', '').replace(')', '').strip().replace(' ', '').lower() if len(parts) > 1 else '1'
         
         print(f"Debug: For metric '{metric}', num_expr = '{num_expr}', den_expr = '{den_expr}'")  # Debug
         
         if ',' in num_expr:
-            num_cols = [col_map.get(col.strip(), col.strip()) for col in num_expr.split(',')]
+            num_cols = [col_map.get(col.strip().lower(), col.strip()) for col in num_expr.split(',')]
             df['num_temp'] = df[num_cols].sum(axis=1, skipna=True)
             num_expr = 'num_temp'
             temp_cols.append('num_temp')
         if ',' in den_expr:
-            den_cols = [col_map.get(col.strip(), col.strip()) for col in den_expr.split(',')]
+            den_cols = [col_map.get(col.strip().lower(), col.strip()) for col in den_expr.split(',')]
             df['den_temp'] = df[den_cols].sum(axis=1, skipna=True)
             den_expr = 'den_temp'
             temp_cols.append('den_temp')
         groupby_dims = self.semantic_layer['metrics'][metric].get('dimensions', ['country_code', 'drive_month'])[:2]
+        print(f"Debug: Using groupby_dims: {groupby_dims}")  # Debug
         if df.empty:
             logging.warning(f"No data for grouping in metric {metric}")
             continue
         grouped = df.groupby(groupby_dims).agg({num_expr: 'sum', den_expr: 'sum'}).reset_index()
-        print(f"Debug: Grouped shape: {grouped.shape}, columns: {grouped.columns.tolist()}")  # Debug grouped
+        print(f"Debug: Grouped shape: {grouped.shape}, columns: {grouped.columns.tolist()}")  # Debug
         if grouped.empty:
             logging.warning(f"Empty grouped DataFrame for metric {metric}")
             continue
-        # Apply constraints
         if 'constraints' in self.semantic_layer['metrics'][metric]:
             for constraint in self.semantic_layer['metrics'][metric]['constraints']:
                 if 'Total_KM > 0' in constraint and grouped[den_expr].eq(0).all():
                     grouped[metric] = np.nan
         grouped[metric] = grouped[num_expr] / grouped[den_expr].replace(0, np.nan)
-        # Apply business rules
+        # Add the computed metric directly to the filtered DataFrame
+        df = df.merge(grouped[[*groupby_dims, metric]], on=groupby_dims, how='left')
         if metric == 'efficiency' and 'business_rules' in self.semantic_layer['metrics'][metric]:
-            mask = (grouped[metric] < 0) | (grouped[metric] > 2)
-            grouped.loc[mask, metric] = np.nan
-        df = df.merge(grouped[[*groupby_dims, metric]], on=groupby_dims, how='left')  # Fixed: Use grouped[[*groupby_dims, metric]]
+            mask = (df[metric] < 0) | (df[metric] > 2)
+            df.loc[mask, metric] = np.nan
     df.drop(columns=temp_cols, inplace=True, errors='ignore')
-    print(f"Debug: After compute_metrics, df columns: {df.columns.tolist()}")  # Debug final columns
+    print(f"Debug: After compute_metrics, df columns: {df.columns.tolist()}")  # Debug
     return df
